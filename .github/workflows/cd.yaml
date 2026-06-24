@@ -58,17 +58,23 @@ jobs:
         run: |
           echo "Validating dev static manifests..."
           # Check YAML syntax correctness of all manifests
-          find k8s/dev-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '{}'
+          find k8s/dev-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '.' '{}' > /dev/null
 
       - name: Validate Prod Manifests (Dry Run)
         run: |
           echo "Validating prod static manifests..."
-          find k8s/prod-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '{}'
+          find k8s/prod-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '.' '{}' > /dev/null
+
+      - name: Validate ArgoCD Application Manifests (Dry Run)
+        run: |
+          echo "Validating ArgoCD manifests..."
+          find argocd -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '.' '{}' > /dev/null
 
   deploy:
     name: ArgoCD Sync
     needs: validate
     runs-on: ubuntu-latest
+    if: ${{ secrets.ARGOCD_SERVER && secrets.ARGOCD_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
