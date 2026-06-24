@@ -9,12 +9,13 @@ on:
         type: choice
         options:
           - api-gateway
-          - frontend
+          - frontend-ui
           - incidents-service
-          - telemetry-service
+          - telemetry-store
           - analysis-service
           - dependency-service
           - ingest-service
+          - worker-service
 
       version:
         description: "New production version tag, example: v1.0.0"
@@ -24,10 +25,14 @@ on:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout Helm repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Validate version format
         run: |
@@ -38,40 +43,53 @@ jobs:
 
       - name: Install yq
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          if ! command -v yq &> /dev/null; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
 
       - name: Read dev image tag
         id: devtag
         run: |
           SERVICE="${{ github.event.inputs.service_name }}"
-          
-          # Read from Helm values.yaml
-          if [ "$SERVICE" = "api-gateway" ]; then
-            DEV_TAG=$(yq '.apiGateway.tag' helm/values.yaml)
-          elif [ "$SERVICE" = "frontend" ]; then
-            DEV_TAG=$(yq '.frontend.tag' helm/values.yaml)
-          else
-            # Map telemetry-service input name to telemetry-store value in helm
-            HELM_SERVICE_NAME="$SERVICE"
-            if [ "$SERVICE" = "telemetry-service" ]; then
-              HELM_SERVICE_NAME="telemetry-store"
-            fi
-            DEV_TAG=$(yq '.backends[] | select(.name == "'"$HELM_SERVICE_NAME"'") | .tag' helm/values.yaml)
+          SERVICE_DIR="$SERVICE"
+          if [ "$SERVICE" = "frontend-ui" ]; then
+            SERVICE_DIR="frontend"
           fi
-
-          if [ -z "$DEV_TAG" ] || [ "$DEV_TAG" = "null" ]; then
-            echo "ERROR: dev tag not found in helm/values.yaml for $SERVICE"
+          
+          DEV_FILE="k8s/dev-apps/$SERVICE_DIR/deployment.yaml"
+          if [ ! -f "$DEV_FILE" ]; then
+            DEV_FILE="kubernetes-main/$DEV_FILE"
+          fi
+          if [ ! -f "$DEV_FILE" ]; then
+            echo "ERROR: $DEV_FILE not found in repository"
             exit 1
           fi
-
+          
+          # Extract the image from dev deployments
+          IMAGE_PATH=$(yq eval 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image' "$DEV_FILE")
+          if [ -z "$IMAGE_PATH" ] || [ "$IMAGE_PATH" = "null" ]; then
+            echo "ERROR: Could not find image for service $SERVICE in $DEV_FILE"
+            exit 1
+          fi
+          
+          # Extract tag and base image
+          DEV_TAG=$(echo "$IMAGE_PATH" | awk -F: '{print $2}')
+          BASE_IMAGE=$(echo "$IMAGE_PATH" | awk -F: '{print $1}')
+          
+          if [ -z "$DEV_TAG" ] || [ "$DEV_TAG" = "null" ]; then
+            echo "ERROR: image tag not found for $SERVICE in $DEV_FILE"
+            exit 1
+          fi
+          
           echo "dev_tag=$DEV_TAG" >> "$GITHUB_OUTPUT"
-          echo "Dev tag found: $DEV_TAG"
+          echo "base_image=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Dev tag found: $DEV_TAG for image: $BASE_IMAGE"
 
       - name: Docker login to ACR
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          registry: ${{ secrets.ACR_LOGIN_SERVER || 'incidenttracker.azurecr.io' }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
@@ -80,123 +98,88 @@ jobs:
           SERVICE="${{ github.event.inputs.service_name }}"
           DEV_TAG="${{ steps.devtag.outputs.dev_tag }}"
           PROD_TAG="${{ github.event.inputs.version }}"
+          BASE_IMAGE="${{ steps.devtag.outputs.base_image }}"
           
-          # Resolve ACR image name mapping
-          IMAGE_NAME="$SERVICE"
-          if [ "$SERVICE" = "telemetry-service" ]; then
-            IMAGE_NAME="telemetry-service"
-          elif [ "$SERVICE" = "frontend" ]; then
-            IMAGE_NAME="frontend"
-          fi
-          
-          SOURCE_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$DEV_TAG"
-          PROD_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$PROD_TAG"
+          SOURCE_IMAGE="$BASE_IMAGE:$DEV_TAG"
+          PROD_IMAGE="$BASE_IMAGE:$PROD_TAG"
           
           echo "Pulling source image: $SOURCE_IMAGE"
           docker pull "$SOURCE_IMAGE"
-          
           echo "Retagging image: $PROD_IMAGE"
           docker tag "$SOURCE_IMAGE" "$PROD_IMAGE"
-          
           echo "Pushing prod image: $PROD_IMAGE"
           docker push "$PROD_IMAGE"
 
-      - name: Update values file and manifests
+      - name: Update prod deployments file
         run: |
           SERVICE="${{ github.event.inputs.service_name }}"
           PROD_TAG="${{ github.event.inputs.version }}"
+          BASE_IMAGE="${{ steps.devtag.outputs.base_image }}"
           
-          # Update Helm values-prod.yaml
-          if [ "$SERVICE" = "api-gateway" ]; then
-            yq -i '.apiGateway.tag = "'"$PROD_TAG"'"' helm/values-prod.yaml
-          elif [ "$SERVICE" = "frontend" ]; then
-            yq -i '.frontend.tag = "'"$PROD_TAG"'"' helm/values-prod.yaml
-          else
-            # Ensure backends list structure is present or append/update it
-            HELM_SERVICE_NAME="$SERVICE"
-            if [ "$SERVICE" = "telemetry-service" ]; then
-              HELM_SERVICE_NAME="telemetry-store"
-            fi
-            
-            # Check if backends section exists in values-prod.yaml
-            if ! yq eval '.backends' helm/values-prod.yaml | grep -q 'backends'; then
-              # Initialize backends array if not present
-              echo "backends:" >> helm/values-prod.yaml
-            fi
-            
-            # Update backend tag in values-prod.yaml
-            yq -i '(.backends[] | select(.name == "'"$HELM_SERVICE_NAME"'") | .tag) = "'"$PROD_TAG"'"' helm/values-prod.yaml
-          fi
-
-          # Update static manifests under k8s/prod-apps/ if they exist
-          PROD_MANIFEST_DIR="k8s/prod-apps/$SERVICE"
-          if [ "$SERVICE" = "frontend" ]; then
-            PROD_MANIFEST_DIR="k8s/prod-apps/frontend"
-          elif [ "$SERVICE" = "telemetry-service" ]; then
-            PROD_MANIFEST_DIR="k8s/prod-apps/telemetry-store"
+          SERVICE_DIR="$SERVICE"
+          if [ "$SERVICE" = "frontend-ui" ]; then
+            SERVICE_DIR="frontend"
           fi
           
-          PROD_MANIFEST="$PROD_MANIFEST_DIR/deployment.yaml"
-          if [ -f "$PROD_MANIFEST" ]; then
-            # Resolve image prefix
-            IMAGE_NAME="$SERVICE"
-            if [ "$SERVICE" = "frontend" ]; then
-              IMAGE_NAME="web-app"
-            elif [ "$SERVICE" = "telemetry-service" ]; then
-              IMAGE_NAME="telemetry-store"
-            fi
-            yq -i '.spec.template.spec.containers[0].image = "incidenttracker.azurecr.io/'"$IMAGE_NAME"':'"$PROD_TAG"'"' "$PROD_MANIFEST"
+          PROD_FILE="k8s/prod-apps/$SERVICE_DIR/deployment.yaml"
+          if [ ! -f "$PROD_FILE" ]; then
+            PROD_FILE="kubernetes-main/$PROD_FILE"
           fi
-
+          if [ ! -f "$PROD_FILE" ]; then
+            echo "ERROR: $PROD_FILE not found in repository"
+            exit 1
+          fi
+          
+          OLD_PROD_TAG=$(yq eval 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image' "$PROD_FILE" | awk -F: '{print $2}')
+          echo "Service: $SERVICE"
+          echo "Old prod tag: $OLD_PROD_TAG"
+          echo "New prod tag: $PROD_TAG"
+          
+          # Update deployments.yaml for production
+          yq eval -i '(select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = "'"$BASE_IMAGE:$PROD_TAG"'"' "$PROD_FILE"
+          git add "$PROD_FILE"
+          
+          # Update nested kubernetes-main copy if it exists and is a different file
+          NESTED_PROD_FILE="kubernetes-main/k8s/prod-apps/$SERVICE_DIR/deployment.yaml"
+          if [ "$PROD_FILE" != "$NESTED_PROD_FILE" ] && [ -f "$NESTED_PROD_FILE" ]; then
+            yq eval -i '(select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = "'"$BASE_IMAGE:$PROD_TAG"'"' "$NESTED_PROD_FILE"
+            git add "$NESTED_PROD_FILE"
+          fi
+          
           git config user.name "incidenttracker-ci-bot"
           git config user.email "ci-bot@incidenttracker.local"
-          
-          if git diff --quiet; then
+          if git diff --quiet --cached; then
             echo "No change. $SERVICE prod already has tag $PROD_TAG"
             exit 0
-          fi
-          
-          git add helm/values-prod.yaml
-          if [ -f "$PROD_MANIFEST" ]; then
-            git add "$PROD_MANIFEST"
           fi
           
           git commit -m "promote($SERVICE): ${{ steps.devtag.outputs.dev_tag }} -> $PROD_TAG"
           git push
 
-      - name: Notify success
-        if: success()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "✅ [Incident Tracker CI] ${{ github.event.inputs.service_name }} production promotion succeeded"
-          to: ${{ secrets.NOTIFICATION_RECIPIENTS }}
-          from: Incident Tracker CI <${{ secrets.SMTP_USERNAME }}>
-          html_body: |
-            <h2>Production Promotion Succeeded</h2>
-            <p><strong>Service:</strong> ${{ github.event.inputs.service_name }}</p>
-            <p><strong>Dev source tag:</strong> ${{ steps.devtag.outputs.dev_tag }}</p>
-            <p><strong>Production tag:</strong> ${{ github.event.inputs.version }}</p>
-            <p><strong>Triggered by:</strong> ${{ github.actor }}</p>
-            <p><a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View workflow run</a></p>
-
-      - name: Notify failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "❌ [Incident Tracker CI] ${{ github.event.inputs.service_name }} production promotion failed"
-          to: ${{ secrets.NOTIFICATION_RECIPIENTS }}
-          from: Incident Tracker CI <${{ secrets.SMTP_USERNAME }}>
-          html_body: |
-            <h2>Production Promotion Failed</h2>
-            <p><strong>Service:</strong> ${{ github.event.inputs.service_name }}</p>
-            <p><strong>Requested production tag:</strong> ${{ github.event.inputs.version }}</p>
-            <p><strong>Triggered by:</strong> ${{ github.actor }}</p>
-            <p><a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View workflow run</a></p>
+      - name: Slack Notification
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SERVICE: ${{ github.event.inputs.service_name }}
+          DEV_TAG: ${{ steps.devtag.outputs.dev_tag }}
+          PROD_TAG: ${{ github.event.inputs.version }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            MESSAGE="🚀 *Production Promotion Success* 🚀\n*Service:* \`${SERVICE}\`\n*Dev source tag:* \`${DEV_TAG}\`\n*Production tag:* \`${PROD_TAG}\`\n*Triggered by:* \`${{ github.actor }}\`\nPromotion completed successfully! ✅"
+            echo "### Production Promotion Success ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- **Service:** $SERVICE" >> $GITHUB_STEP_SUMMARY
+            echo "- **Dev Source Tag:** $DEV_TAG" >> $GITHUB_STEP_SUMMARY
+            echo "- **Production Tag:** $PROD_TAG" >> $GITHUB_STEP_SUMMARY
+            echo "- **Triggered By:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          else
+            MESSAGE="❌ *Production Promotion Failure* ❌\n*Service:* \`${SERVICE}\`\n*Requested production tag:* \`${PROD_TAG}\`\n*Triggered by:* \`${{ github.actor }}\`\nPromotion failed. Please check the workflow logs."
+            echo "### Production Promotion Failure ❌" >> $GITHUB_STEP_SUMMARY
+            echo "- **Service:** $SERVICE" >> $GITHUB_STEP_SUMMARY
+            echo "- **Requested Production Tag:** $PROD_TAG" >> $GITHUB_STEP_SUMMARY
+            echo "- **Triggered By:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Send Slack notification using the webhook URL directly without conditional skip checks
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" "$SLACK_WEBHOOK_URL"
