@@ -17,7 +17,7 @@ spec:
       serviceAccountName: incident-tracker-sa
       containers:
         - name: api-gateway
-          image: incidenttracker.azurecr.io/api-gateway:v1.2.3
+          image: incidenttracker.azurecr.io/api-gateway:v2.6.7
           ports:
             - containerPort: 8000
           envFrom:
