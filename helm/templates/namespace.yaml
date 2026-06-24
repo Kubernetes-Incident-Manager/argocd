@@ -1,0 +1,7 @@
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  labels:
+    environment: {{ .Values.global.environment | default "dev" }}

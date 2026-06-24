@@ -1,0 +1,13 @@
+# Local binaries
+yq.exe
+yq
+helm-bin/
+helm-bin
+
+# Temporary template files
+dev-template.yaml
+prod-template.yaml
+
+# OS files
+.DS_Store
+Thumbs.db

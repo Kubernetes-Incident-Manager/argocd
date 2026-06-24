@@ -1,0 +1,36 @@
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+{{- $gw := .Values.gateway | default dict -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: incident-tracker-route
+  namespace: {{ $namespace }}
+spec:
+  parentRefs:
+    - name: {{ get $gw "name" | default "incident-tracker-gateway" }}
+  rules:
+    {{- range .Values.backends }}
+    {{- if .routePath }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ .routePath }}
+      backendRefs:
+        - name: {{ .name }}-svc
+          port: {{ .port }}
+    {{- end }}
+    {{- end }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /cluster
+      backendRefs:
+        - name: {{ .Values.apiGateway.name }}-svc
+          port: {{ .Values.apiGateway.servicePort }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Values.frontend.name }}
+          port: {{ .Values.frontend.servicePort }}

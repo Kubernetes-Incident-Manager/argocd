@@ -1,0 +1,132 @@
+name: ArgoCD GitOps Continuous Delivery
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'k8s/**'
+      - 'helm/**'
+      - 'argocd/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment to Sync'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+          - both
+      sync_action:
+        description: 'Sync action to perform'
+        required: true
+        default: 'sync'
+        type: choice
+        options:
+          - sync
+          - diff-only
+
+jobs:
+  validate:
+    name: Lint & Validate Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.12.0'
+
+      - name: Helm Lint
+        run: |
+          echo "Linting Helm chart..."
+          helm lint helm
+
+      - name: Dry Run Template Generation
+        run: |
+          echo "Generating Dev templates..."
+          helm template incident-manager helm --values helm/values-dev.yaml > dev-template.yaml
+          
+          echo "Generating Prod templates..."
+          helm template incident-manager helm --values helm/values-prod.yaml > prod-template.yaml
+
+      - name: Validate Dev Manifests (Dry Run)
+        run: |
+          echo "Validating dev static manifests..."
+          # Check YAML syntax correctness of all manifests
+          find k8s/dev-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '{}'
+
+      - name: Validate Prod Manifests (Dry Run)
+        run: |
+          echo "Validating prod static manifests..."
+          find k8s/prod-apps -name "*.yaml" -o -name "*.yml" | xargs -I {} yq eval '{}'
+
+  deploy:
+    name: ArgoCD Sync
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install ArgoCD CLI
+        run: |
+          echo "Downloading ArgoCD CLI..."
+          curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Configure ArgoCD Authentication
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+        run: |
+          if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_TOKEN" ]; then
+            echo "Error: ARGOCD_SERVER and ARGOCD_TOKEN must be set in GitHub Secrets."
+            exit 1
+          fi
+          # Authenticate with ArgoCD server using --grpc-web
+          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" --ssl-verify=false --grpc-web
+
+      - name: Sync Dev Application
+        if: |
+          github.event_name == 'push' || 
+          (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'dev' || github.event.inputs.environment == 'both'))
+        env:
+          SYNC_ACTION: ${{ github.event.inputs.sync_action || 'sync' }}
+        run: |
+          APP_NAME="kubernetes-incident-manager-dev"
+          
+          if [ "$SYNC_ACTION" = "diff-only" ]; then
+            echo "Running diff against dev application..."
+            argocd app diff "$APP_NAME" --grpc-web || true
+          else
+            echo "Syncing dev application: $APP_NAME..."
+            argocd app sync "$APP_NAME" --prune --grpc-web
+            
+            echo "Waiting for dev application to become healthy..."
+            argocd app wait "$APP_NAME" --health --timeout 300 --grpc-web
+          fi
+
+      - name: Sync Prod Application
+        if: |
+          (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'prod' || github.event.inputs.environment == 'both'))
+        env:
+          SYNC_ACTION: ${{ github.event.inputs.sync_action || 'sync' }}
+        run: |
+          APP_NAME="kubernetes-incident-manager-prod"
+          
+          if [ "$SYNC_ACTION" = "diff-only" ]; then
+            echo "Running diff against prod application..."
+            argocd app diff "$APP_NAME" --grpc-web || true
+          else
+            echo "Syncing prod application: $APP_NAME..."
+            argocd app sync "$APP_NAME" --prune --grpc-web
+            
+            echo "Waiting for prod application to become healthy..."
+            argocd app wait "$APP_NAME" --health --timeout 300 --grpc-web
+          fi

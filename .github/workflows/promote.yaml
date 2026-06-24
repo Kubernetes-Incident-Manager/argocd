@@ -1,0 +1,202 @@
+name: Promote Service to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: "Select service to promote"
+        required: true
+        type: choice
+        options:
+          - api-gateway
+          - frontend
+          - incidents-service
+          - telemetry-service
+          - analysis-service
+          - dependency-service
+          - ingest-service
+
+      version:
+        description: "New production version tag, example: v1.0.0"
+        required: true
+        type: string
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Helm repo
+        uses: actions/checkout@v4
+
+      - name: Validate version format
+        run: |
+          if ! [[ "${{ github.event.inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: version must match vX.Y.Z (e.g. v1.2.3)"
+            exit 1
+          fi
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Read dev image tag
+        id: devtag
+        run: |
+          SERVICE="${{ github.event.inputs.service_name }}"
+          
+          # Read from Helm values.yaml
+          if [ "$SERVICE" = "api-gateway" ]; then
+            DEV_TAG=$(yq '.apiGateway.tag' helm/values.yaml)
+          elif [ "$SERVICE" = "frontend" ]; then
+            DEV_TAG=$(yq '.frontend.tag' helm/values.yaml)
+          else
+            # Map telemetry-service input name to telemetry-store value in helm
+            HELM_SERVICE_NAME="$SERVICE"
+            if [ "$SERVICE" = "telemetry-service" ]; then
+              HELM_SERVICE_NAME="telemetry-store"
+            fi
+            DEV_TAG=$(yq '.backends[] | select(.name == "'"$HELM_SERVICE_NAME"'") | .tag' helm/values.yaml)
+          fi
+
+          if [ -z "$DEV_TAG" ] || [ "$DEV_TAG" = "null" ]; then
+            echo "ERROR: dev tag not found in helm/values.yaml for $SERVICE"
+            exit 1
+          fi
+
+          echo "dev_tag=$DEV_TAG" >> "$GITHUB_OUTPUT"
+          echo "Dev tag found: $DEV_TAG"
+
+      - name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Pull dev image, retag and push prod image
+        run: |
+          SERVICE="${{ github.event.inputs.service_name }}"
+          DEV_TAG="${{ steps.devtag.outputs.dev_tag }}"
+          PROD_TAG="${{ github.event.inputs.version }}"
+          
+          # Resolve ACR image name mapping
+          IMAGE_NAME="$SERVICE"
+          if [ "$SERVICE" = "telemetry-service" ]; then
+            IMAGE_NAME="telemetry-service"
+          elif [ "$SERVICE" = "frontend" ]; then
+            IMAGE_NAME="frontend"
+          fi
+          
+          SOURCE_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$DEV_TAG"
+          PROD_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$PROD_TAG"
+          
+          echo "Pulling source image: $SOURCE_IMAGE"
+          docker pull "$SOURCE_IMAGE"
+          
+          echo "Retagging image: $PROD_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$PROD_IMAGE"
+          
+          echo "Pushing prod image: $PROD_IMAGE"
+          docker push "$PROD_IMAGE"
+
+      - name: Update values file and manifests
+        run: |
+          SERVICE="${{ github.event.inputs.service_name }}"
+          PROD_TAG="${{ github.event.inputs.version }}"
+          
+          # Update Helm values-prod.yaml
+          if [ "$SERVICE" = "api-gateway" ]; then
+            yq -i '.apiGateway.tag = "'"$PROD_TAG"'"' helm/values-prod.yaml
+          elif [ "$SERVICE" = "frontend" ]; then
+            yq -i '.frontend.tag = "'"$PROD_TAG"'"' helm/values-prod.yaml
+          else
+            # Ensure backends list structure is present or append/update it
+            HELM_SERVICE_NAME="$SERVICE"
+            if [ "$SERVICE" = "telemetry-service" ]; then
+              HELM_SERVICE_NAME="telemetry-store"
+            fi
+            
+            # Check if backends section exists in values-prod.yaml
+            if ! yq eval '.backends' helm/values-prod.yaml | grep -q 'backends'; then
+              # Initialize backends array if not present
+              echo "backends:" >> helm/values-prod.yaml
+            fi
+            
+            # Update backend tag in values-prod.yaml
+            yq -i '(.backends[] | select(.name == "'"$HELM_SERVICE_NAME"'") | .tag) = "'"$PROD_TAG"'"' helm/values-prod.yaml
+          fi
+
+          # Update static manifests under k8s/prod-apps/ if they exist
+          PROD_MANIFEST_DIR="k8s/prod-apps/$SERVICE"
+          if [ "$SERVICE" = "frontend" ]; then
+            PROD_MANIFEST_DIR="k8s/prod-apps/frontend"
+          elif [ "$SERVICE" = "telemetry-service" ]; then
+            PROD_MANIFEST_DIR="k8s/prod-apps/telemetry-store"
+          fi
+          
+          PROD_MANIFEST="$PROD_MANIFEST_DIR/deployment.yaml"
+          if [ -f "$PROD_MANIFEST" ]; then
+            # Resolve image prefix
+            IMAGE_NAME="$SERVICE"
+            if [ "$SERVICE" = "frontend" ]; then
+              IMAGE_NAME="web-app"
+            elif [ "$SERVICE" = "telemetry-service" ]; then
+              IMAGE_NAME="telemetry-store"
+            fi
+            yq -i '.spec.template.spec.containers[0].image = "incidenttracker.azurecr.io/'"$IMAGE_NAME"':'"$PROD_TAG"'"' "$PROD_MANIFEST"
+          fi
+
+          git config user.name "incidenttracker-ci-bot"
+          git config user.email "ci-bot@incidenttracker.local"
+          
+          if git diff --quiet; then
+            echo "No change. $SERVICE prod already has tag $PROD_TAG"
+            exit 0
+          fi
+          
+          git add helm/values-prod.yaml
+          if [ -f "$PROD_MANIFEST" ]; then
+            git add "$PROD_MANIFEST"
+          fi
+          
+          git commit -m "promote($SERVICE): ${{ steps.devtag.outputs.dev_tag }} -> $PROD_TAG"
+          git push
+
+      - name: Notify success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "✅ [Incident Tracker CI] ${{ github.event.inputs.service_name }} production promotion succeeded"
+          to: ${{ secrets.NOTIFICATION_RECIPIENTS }}
+          from: Incident Tracker CI <${{ secrets.SMTP_USERNAME }}>
+          html_body: |
+            <h2>Production Promotion Succeeded</h2>
+            <p><strong>Service:</strong> ${{ github.event.inputs.service_name }}</p>
+            <p><strong>Dev source tag:</strong> ${{ steps.devtag.outputs.dev_tag }}</p>
+            <p><strong>Production tag:</strong> ${{ github.event.inputs.version }}</p>
+            <p><strong>Triggered by:</strong> ${{ github.actor }}</p>
+            <p><a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View workflow run</a></p>
+
+      - name: Notify failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ [Incident Tracker CI] ${{ github.event.inputs.service_name }} production promotion failed"
+          to: ${{ secrets.NOTIFICATION_RECIPIENTS }}
+          from: Incident Tracker CI <${{ secrets.SMTP_USERNAME }}>
+          html_body: |
+            <h2>Production Promotion Failed</h2>
+            <p><strong>Service:</strong> ${{ github.event.inputs.service_name }}</p>
+            <p><strong>Requested production tag:</strong> ${{ github.event.inputs.version }}</p>
+            <p><strong>Triggered by:</strong> ${{ github.actor }}</p>
+            <p><a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View workflow run</a></p>
