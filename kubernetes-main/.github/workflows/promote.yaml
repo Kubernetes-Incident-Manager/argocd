@@ -181,5 +181,9 @@ jobs:
             echo "- **Triggered By:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
           fi
           
-          # Send Slack notification using the webhook URL directly without conditional skip checks
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" "$SLACK_WEBHOOK_URL"
+          # Send Slack notification using the webhook URL conditionally
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" "$SLACK_WEBHOOK_URL"
+          else
+            echo "Slack Webhook URL is not set. Skipping Slack notification."
+          fi
